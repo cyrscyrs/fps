@@ -1,0 +1,603 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+using UnityMCP.Editor.Handlers;
+
+namespace UnityMCP.Editor.Core
+{
+    /// <summary>
+    /// The Model Context Protocol endpoint, spoken over Streamable HTTP at <c>/mcp</c>.
+    /// </summary>
+    /// <remarks>
+    /// Socket-free by construction: it takes the method, headers and body of a request and
+    /// returns a status and JSON body, so the whole protocol is testable without an
+    /// <see cref="System.Net.HttpListener"/>. <see cref="McpHttpServer"/> only copies bytes in
+    /// and out.
+    /// <para>
+    /// Stateless on purpose. No <c>Mcp-Session-Id</c> is issued, so a client whose Editor was
+    /// restarted keeps working without renegotiating, and a request that arrives before
+    /// <c>initialize</c> is served rather than refused. Nothing is ever pushed to the client:
+    /// GET (the SSE stream) answers 405, and <c>listChanged</c> is advertised as false. The
+    /// official SDK clients treat both as normal.
+    /// </para>
+    /// <para>
+    /// Bearer authentication runs in the server before this class sees a request. The Origin
+    /// check here is defence in depth against a browser page that has somehow obtained the
+    /// token; the protocol-version check is what the specification requires of servers.
+    /// </para>
+    /// </remarks>
+    internal sealed class McpStreamableHttpEndpoint
+    {
+        /// <summary>Protocol revisions this endpoint speaks, newest first.</summary>
+        public static readonly string[] SupportedProtocolVersions = { "2025-11-25", "2025-06-18", "2025-03-26" };
+
+        /// <summary>Assumed when a client sends no <c>MCP-Protocol-Version</c> header.</summary>
+        private const string DefaultProtocolVersion = "2025-03-26";
+
+        public const string Instructions =
+            "Controls this project's running Unity Editor. Search tools for Unity inspection, edits or debugging: " +
+            "scenes, assets, prefabs, rendering, play mode, tests and builds.\n" +
+            "Prefixes: scene_ gameobject_ inspect_ asset_ prefab_ console_ compile_ play_mode_ timeline_ recorder_ " +
+            "render_ shader_ material_ reflect_ gpu_ test_ build_ project_ editor_ menu_ capture_ execute_ job_ input_ definitions_.\n" +
+            "Read console_read_logs before adding instrumentation. Prefer specific tools; execute_code is a last resort and cannot be undone.\n" +
+            "Tools depend on installed packages (including Timeline/Recorder). If tools disappear after package changes or reload, reconnect to refresh the list.\n" +
+            "When a call returns a job id, fetch job_status. Do not repeat it: the work is still running.";
+
+        private readonly Func<ToolCatalog> catalog;
+        private readonly Func<McpToolDescriptor, JObject, ToolCallOutcome> run;
+        private readonly Func<string> serverVersion;
+        private readonly Func<string> runningNotice;
+
+        /// <param name="runningNotice">
+        /// What is holding the main thread, appended to every "still running" answer; null or a
+        /// function returning null adds nothing.
+        /// </param>
+        public McpStreamableHttpEndpoint(
+            Func<ToolCatalog> catalog,
+            Func<McpToolDescriptor, JObject, ToolCallOutcome> run,
+            Func<string> serverVersion,
+            Func<string> runningNotice = null)
+        {
+            this.catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
+            this.run = run ?? throw new ArgumentNullException(nameof(run));
+            this.serverVersion = serverVersion ?? throw new ArgumentNullException(nameof(serverVersion));
+            this.runningNotice = runningNotice;
+        }
+
+        /// <summary>Answers one HTTP request to the endpoint.</summary>
+        /// <param name="httpMethod">The request method.</param>
+        /// <param name="headers">Request headers; lookup is case-insensitive.</param>
+        /// <param name="body">The request body, or null.</param>
+        /// <param name="groupQuery">
+        /// The <c>group</c> query parameter, a comma-separated list that limits <c>tools/list</c> to
+        /// those groups. Null or empty lists every tool. <c>tools/call</c> is not limited.
+        /// </param>
+        public EndpointResponse Handle(string httpMethod, IReadOnlyDictionary<string, string> headers, string body, string groupQuery = null)
+        {
+            headers ??= new Dictionary<string, string>();
+
+            var groups = McpToolGroups.Parse(groupQuery, out var unknownGroups);
+            if (unknownGroups.Count > 0)
+            {
+                return EndpointResponse.Plain(
+                    400,
+                    $"Unknown tool group '{unknownGroups[0]}'. Known: {string.Join(", ", McpToolGroups.Known)}.");
+            }
+
+            if (!string.Equals(httpMethod, "POST", StringComparison.OrdinalIgnoreCase))
+            {
+                return new EndpointResponse(405, null) { Allow = "POST" };
+            }
+
+            if (TryGet(headers, "Origin", out var origin) && !IsLoopbackOrigin(origin))
+            {
+                return EndpointResponse.Plain(403, "Origin not allowed.");
+            }
+
+            if (TryGet(headers, "MCP-Protocol-Version", out var version) &&
+                Array.IndexOf(SupportedProtocolVersions, version) < 0)
+            {
+                return EndpointResponse.Plain(
+                    400,
+                    $"Unsupported MCP-Protocol-Version '{version}'. Supported: {string.Join(", ", SupportedProtocolVersions)}.");
+            }
+
+            JToken parsed;
+            try
+            {
+                parsed = string.IsNullOrWhiteSpace(body) ? null : JToken.Parse(body);
+            }
+            catch (JsonException e)
+            {
+                return EndpointResponse.Json(200, RpcError(null, -32700, $"Parse error: {e.Message}"));
+            }
+
+            if (parsed is JArray)
+            {
+                return EndpointResponse.Json(200, RpcError(null, -32600, "JSON-RPC batching is not supported."));
+            }
+
+            if (parsed is not JObject message)
+            {
+                return EndpointResponse.Json(200, RpcError(null, -32600, "Expected a JSON-RPC request object."));
+            }
+
+            var id = message["id"];
+            var method = message["method"]?.Type == JTokenType.String ? message["method"].Value<string>() : null;
+
+            var usable = id != null && (id.Type == JTokenType.String || id.Type == JTokenType.Integer);
+
+            if (message["jsonrpc"]?.Type != JTokenType.String
+                || message["jsonrpc"].Value<string>() != "2.0" || string.IsNullOrEmpty(method)
+                || (id != null && !usable))
+            {
+                // The id goes back when it is one the client can match on. Answering a request
+                // that carried a perfectly good id with a null one leaves the client waiting for
+                // a reply it will never recognise.
+                return EndpointResponse.Json(200, RpcError(usable ? id : null, -32600, "Not a JSON-RPC 2.0 request."));
+            }
+
+            // A notification or a response from the client has no id and expects nothing back.
+            if (id == null)
+            {
+                return new EndpointResponse(202, null);
+            }
+
+            if (message["params"] != null && message["params"] is not JObject)
+            {
+                return EndpointResponse.Json(200, RpcError(id, -32602, "params must be an object."));
+            }
+
+            var parameters = message["params"] as JObject ?? new JObject();
+            if (method == "initialize" && parameters["protocolVersion"] != null
+                && parameters["protocolVersion"].Type != JTokenType.String)
+            {
+                return EndpointResponse.Json(200, RpcError(id, -32602, "protocolVersion must be a string."));
+            }
+
+            switch (method)
+            {
+                case "initialize":
+                    return EndpointResponse.Json(200, RpcResult(id, this.Initialize(parameters)));
+
+                case "ping":
+                    return EndpointResponse.Json(200, RpcResult(id, new JObject()));
+
+                case "tools/list":
+                    return this.ListTools(id, groups);
+
+                case "tools/call":
+                    return this.CallTool(id, parameters);
+
+                default:
+                    return EndpointResponse.Json(200, RpcError(id, -32601, $"Method not found: {method}"));
+            }
+        }
+
+        private JObject Initialize(JObject parameters)
+        {
+            var requested = parameters["protocolVersion"]?.Value<string>();
+            var negotiated = requested != null && Array.IndexOf(SupportedProtocolVersions, requested) >= 0
+                ? requested
+                : SupportedProtocolVersions[0];
+
+            return new JObject
+            {
+                ["protocolVersion"] = negotiated,
+                ["capabilities"] = new JObject
+                {
+                    ["tools"] = new JObject { ["listChanged"] = false },
+                },
+                ["serverInfo"] = new JObject
+                {
+                    ["name"] = "unity-mcp",
+                    ["version"] = this.serverVersion(),
+                },
+                ["instructions"] = Instructions,
+            };
+        }
+
+        private static readonly byte[] ListToolsPrefix = System.Text.Encoding.UTF8.GetBytes("{\"jsonrpc\":\"2.0\",\"id\":");
+        private static readonly byte[] ListToolsMiddle = System.Text.Encoding.UTF8.GetBytes(",\"result\":{\"tools\":");
+        private static readonly byte[] ListToolsSuffix = System.Text.Encoding.UTF8.GetBytes("}}");
+
+        /// <summary>
+        /// The list is the one response a client sends on every connect, so it is written from the
+        /// catalog's cached UTF-8 around the request id. Only the id is rendered per request.
+        /// </summary>
+        private EndpointResponse ListTools(JToken id, IReadOnlyList<string> groups)
+        {
+            return EndpointResponse.Raw(
+                200,
+                ListToolsPrefix,
+                System.Text.Encoding.UTF8.GetBytes(id.ToString(Formatting.None)),
+                ListToolsMiddle,
+                this.catalog().ToolsArrayUtf8(groups, mcpShape: true),
+                ListToolsSuffix);
+        }
+
+        private EndpointResponse CallTool(JToken id, JObject parameters)
+        {
+            if (parameters["arguments"] != null && parameters["arguments"] is not JObject)
+            {
+                return EndpointResponse.Json(200, RpcError(id, -32602, "params.arguments must be an object."));
+            }
+
+            var name = parameters["name"]?.Type == JTokenType.String ? parameters["name"].Value<string>() : null;
+            if (string.IsNullOrEmpty(name))
+            {
+                return EndpointResponse.Json(200, RpcError(id, -32602, "tools/call requires params.name."));
+            }
+
+            // Reported as a tool error rather than a protocol error so the model sees the text
+            // and can correct the call instead of the whole request failing.
+            if (!this.catalog().TryGet(name, out var descriptor))
+            {
+                return EndpointResponse.Json(200, RpcResult(id, ToolError(
+                    $"No tool named '{name}'. The tool set may have changed since tools/list; reconnect to refresh it.")));
+            }
+
+            var arguments = parameters["arguments"] as JObject ?? new JObject();
+            var outcome = this.run(descriptor, arguments);
+
+            switch (outcome.State)
+            {
+                case ToolCallOutcome.Kind.Completed:
+                    var reported = HandlerErrorResult.Message(outcome.Result);
+
+                    if (reported != null)
+                    {
+                        return EndpointResponse.Json(200, RpcResult(id, ToolError($"Error [invalid_params]: {reported}")));
+                    }
+
+                    var answered = WithoutInlineImage(outcome.Result, out var picture);
+                    var body = answered.ToString(Formatting.None);
+                    var refused = TooLarge(body, descriptor);
+
+                    // A refusal is not an answer. Sent as an ordinary result it reads as the reply
+                    // the caller asked for, and a model takes the explanation for the data.
+                    if (refused != null)
+                    {
+                        return EndpointResponse.Json(200, RpcResult(id, ToolError(refused)));
+                    }
+
+                    // No structuredContent: no tool here declares an outputSchema, so a client has
+                    // nothing to validate it against, and the spec asks for the same JSON in a text
+                    // block regardless. Sending both put every reply in the model's context twice.
+                    return EndpointResponse.Json(200, RpcResult(id, new JObject
+                    {
+                        ["content"] = ResultContent(body, picture),
+                    }));
+
+                case ToolCallOutcome.Kind.Failed:
+                    var code = outcome.Error switch
+                    {
+                        McpToolException tool => tool.Code,
+                        _ => "internal_error",
+                    };
+                    return EndpointResponse.Json(200, RpcResult(id, ToolError($"Error [{code}]: {outcome.Error.Message}")));
+
+                default:
+                    var text =
+                        $"Still running on the Editor main thread as job {outcome.JobId}. " +
+                        $"Call job_status with job_id \"{outcome.JobId}\" to fetch the result. " +
+                        "Do not retry this call; the work is in progress and retrying would run it twice.";
+
+                    var notice = this.runningNotice?.Invoke();
+
+                    if (notice != null)
+                    {
+                        text += " " + notice;
+                    }
+
+                    return EndpointResponse.Json(200, RpcResult(id, new JObject
+                    {
+                        ["content"] = TextContent(text),
+                    }));
+            }
+        }
+
+        private static JObject ToolError(string text)
+        {
+            return new JObject
+            {
+                ["isError"] = true,
+                ["content"] = TextContent(text),
+            };
+        }
+
+        /// <summary>
+        /// The result with inline PNGs taken out in document order, so every picture travels as
+        /// image content instead of as text.
+        /// </summary>
+        /// <remarks>
+        /// A capture returns its PNG base64-encoded. Left inside the JSON it is a wall of text a
+        /// model cannot look at, and a small screenshot is large enough to crowd out everything
+        /// else in the reply. The structured copy is stripped too: keeping it there shipped the
+        /// same picture twice, once priced by its size and once by its dimensions.
+        /// </remarks>
+        private static JObject WithoutInlineImage(JObject result, out List<string> images)
+        {
+            images = new List<string>();
+
+            if (ImageCarrier(result) == null)
+            {
+                return result;
+            }
+
+            var describing = (JObject)result.DeepClone();
+            ExtractImages(describing, images);
+
+            return describing;
+        }
+
+        private static void ExtractImages(JToken node, List<string> images)
+        {
+            if (node is JObject body)
+            {
+                if (body["image"] is JValue value && value.Type == JTokenType.String
+                    && IsEncodedPng(value.ToString()))
+                {
+                    images.Add(value.ToString());
+                    body.Remove("image");
+                }
+
+                foreach (var property in body.Properties()) ExtractImages(property.Value, images);
+            }
+            else if (node is JArray array)
+            {
+                foreach (var item in array) ExtractImages(item, images);
+            }
+        }
+
+        /// <summary>The object holding an <c>image</c> that is base64 of a PNG, or null.</summary>
+        /// <remarks>
+        /// Searched for rather than looked up in a fixed place. A capture answered inline carries
+        /// the PNG at the top, job_status nests it under <c>result</c> because that reply is the
+        /// job's detail rather than the tool's own, and input_replay puts it under <c>capture</c>.
+        /// Each position that was hardcoded here shipped the next tool's base64 as text.
+        /// </remarks>
+        private static JObject ImageCarrier(JToken node)
+        {
+            if (node is JObject body)
+            {
+                if (body["image"] is JValue value
+                    && value.Type == JTokenType.String
+                    && IsEncodedPng(value.ToString()))
+                {
+                    return body;
+                }
+
+                foreach (var property in body.Properties())
+                {
+                    var found = ImageCarrier(property.Value);
+
+                    if (found != null)
+                    {
+                        return found;
+                    }
+                }
+            }
+            else if (node is JArray array)
+            {
+                foreach (var item in array)
+                {
+                    var found = ImageCarrier(item);
+
+                    if (found != null)
+                    {
+                        return found;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>The MCP content for a result whose picture has already been taken out.</summary>
+        private static JArray ResultContent(string text, List<string> images)
+        {
+            var content = TextContent(text);
+            foreach (var image in images)
+            {
+                content.Add(new JObject
+                {
+                    ["type"] = "image",
+                    ["data"] = image,
+                    ["mimeType"] = "image/png",
+                });
+            }
+            return content;
+        }
+
+        /// <summary>
+        /// What to say instead of a reply past the size the tool declares, or null to send it.
+        /// </summary>
+        /// <remarks>
+        /// The size was a hint in <c>_meta</c> that nothing checked. A production scene answered
+        /// scene_browse_hierarchy with 893,153 characters against the 200,000 it declares, under
+        /// a <c>truncated</c> of false, which is most of a context window spent on one call that
+        /// says nothing was left out. Refusing costs the caller a round trip; sending costs it
+        /// the conversation.
+        /// </remarks>
+        internal static string TooLarge(string text, McpToolDescriptor descriptor)
+        {
+            var cap = descriptor?.MaxResultSizeChars ?? 0;
+
+            if (cap <= 0 || text.Length <= cap)
+            {
+                return null;
+            }
+
+            // JSON runs near 2.8 characters to the token, which is the number worth quoting: the
+            // caller is deciding whether to spend that much of what it has left.
+            var tokens = text.Length / 2.8;
+
+            // The tool's own optional arguments rather than a guess at them. Naming 'limit' and
+            // 'offset' to a tool that has neither is advice that cannot be followed, which is
+            // the same dead end as being told to update through a Package Manager that is not
+            // what loads the package.
+            var narrowing = descriptor.Parameters == null
+                ? null
+                : string.Join(", ", descriptor.Parameters
+                    .Where(p => !p.Required)
+                    .Select(p => "'" + p.Name + "'"));
+
+            var advice = string.IsNullOrEmpty(narrowing)
+                ? "This tool takes no arguments to narrow it by, so ask something narrower instead."
+                : $"Ask for less of it with one of this tool's own arguments: {narrowing}.";
+
+            return $"'{descriptor.Name}' answered with {text.Length:N0} characters, past the "
+                   + $"{cap:N0} it declares as its limit, so the reply was not sent: it would "
+                   + $"have cost roughly {tokens:N0} tokens. {advice}";
+        }
+
+        /// <summary>Whether the text is base64 of something that begins like a PNG.</summary>
+        /// <remarks>
+        /// A field called <c>image</c> is not a promise that it holds one: a tool answering with
+        /// an asset path would have had that path taken out of its reply and sent as picture data.
+        /// The eight bytes a PNG opens with settle it. Ten base64 characters is as far as they
+        /// reach on their own — the eleventh carries four bits of the ninth byte, so it varies
+        /// with what follows and a longer prefix rejects real images.
+        /// </remarks>
+        private static bool IsEncodedPng(string text)
+        {
+            return text.StartsWith("iVBORw0KGg", StringComparison.Ordinal);
+        }
+
+        private static JArray TextContent(string text)
+        {
+            return new JArray
+            {
+                new JObject { ["type"] = "text", ["text"] = text },
+            };
+        }
+
+        private static JObject RpcResult(JToken id, JObject result)
+        {
+            return new JObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id,
+                ["result"] = result,
+            };
+        }
+
+        private static JObject RpcError(JToken id, int code, string message)
+        {
+            return new JObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id ?? JValue.CreateNull(),
+                ["error"] = new JObject
+                {
+                    ["code"] = code,
+                    ["message"] = message,
+                },
+            };
+        }
+
+        private static bool IsLoopbackOrigin(string origin)
+        {
+            if (string.IsNullOrEmpty(origin) || origin == "null")
+            {
+                return false;
+            }
+
+            if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri))
+            {
+                return false;
+            }
+
+            return uri.IsLoopback;
+        }
+
+        private static bool TryGet(IReadOnlyDictionary<string, string> headers, string name, out string value)
+        {
+            foreach (var pair in headers)
+            {
+                if (string.Equals(pair.Key, name, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(pair.Value))
+                {
+                    value = pair.Value;
+                    return true;
+                }
+            }
+
+            value = null;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// What the endpoint wants written back: a status, an optional Allow header, and either a
+    /// JSON body to serialise or pre-rendered UTF-8 segments to copy out.
+    /// </summary>
+    internal sealed class EndpointResponse
+    {
+        public int Status { get; }
+
+        /// <summary>The body to serialise, or null for an empty or pre-rendered response.</summary>
+        public JObject Body { get; }
+
+        /// <summary>Pre-rendered UTF-8 written in order, or null when <see cref="Body"/> applies.</summary>
+        public byte[][] Segments { get; }
+
+        /// <summary>Value of the <c>Allow</c> header, set on 405.</summary>
+        public string Allow { get; set; }
+
+        /// <summary>True when there is something to write.</summary>
+        public bool HasContent => this.Body != null || this.Segments != null;
+
+        /// <summary>The response text, whichever form it is in. For tests and logs.</summary>
+        public string Text
+        {
+            get
+            {
+                if (this.Segments != null)
+                {
+                    var total = 0;
+                    foreach (var segment in this.Segments)
+                    {
+                        total += segment.Length;
+                    }
+
+                    var joined = new byte[total];
+                    var offset = 0;
+                    foreach (var segment in this.Segments)
+                    {
+                        System.Buffer.BlockCopy(segment, 0, joined, offset, segment.Length);
+                        offset += segment.Length;
+                    }
+
+                    return System.Text.Encoding.UTF8.GetString(joined);
+                }
+
+                return this.Body?.ToString(Formatting.None);
+            }
+        }
+
+        public EndpointResponse(int status, JObject body)
+        {
+            this.Status = status;
+            this.Body = body;
+        }
+
+        private EndpointResponse(int status, byte[][] segments)
+        {
+            this.Status = status;
+            this.Segments = segments;
+        }
+
+        public static EndpointResponse Json(int status, JObject body) => new(status, body);
+
+        public static EndpointResponse Raw(int status, params byte[][] segments) => new(status, segments);
+
+        /// <summary>An HTTP-level refusal that never reached JSON-RPC, as a small JSON object.</summary>
+        public static EndpointResponse Plain(int status, string message) =>
+            new(status, new JObject { ["error"] = message });
+    }
+}

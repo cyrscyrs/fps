@@ -1,0 +1,226 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+
+using Newtonsoft.Json.Linq;
+using UnityEngine;
+
+using UnityMCP.Editor.Core;
+
+namespace UnityMCP.Editor.Handlers
+{
+    internal static class LogReader
+    {
+        private static readonly Type LogEntriesType;
+        private static readonly Type LogEntryType;
+        private static readonly MethodInfo StartGettingEntriesMethod;
+        private static readonly MethodInfo EndGettingEntriesMethod;
+        private static readonly MethodInfo GetCountMethod;
+        private static readonly MethodInfo GetCountsByTypeMethod;
+        private static readonly MethodInfo GetEntryInternalMethod;
+        private static readonly FieldInfo ModeField;
+        private static readonly FieldInfo MessageField;
+        private static readonly FieldInfo FileField;
+        private static readonly FieldInfo LineField;
+
+        static LogReader()
+        {
+            try
+            {
+                var asm = typeof(UnityEditor.EditorWindow).Assembly;
+                LogEntriesType = asm.GetType("UnityEditor.LogEntries");
+                LogEntryType = asm.GetType("UnityEditor.LogEntry");
+
+                if (LogEntriesType == null || LogEntryType == null)
+                {
+                    Debug.LogError("[SimpleUnityMCP] Failed to find LogEntries/LogEntry types");
+                    return;
+                }
+
+                var flags = BindingFlags.Public | BindingFlags.Static;
+                StartGettingEntriesMethod = LogEntriesType.GetMethod("StartGettingEntries", flags);
+                EndGettingEntriesMethod = LogEntriesType.GetMethod("EndGettingEntries", flags);
+                GetCountMethod = LogEntriesType.GetMethod("GetCount", flags);
+                GetCountsByTypeMethod = LogEntriesType.GetMethod("GetCountsByType", flags);
+                GetEntryInternalMethod = LogEntriesType.GetMethod("GetEntryInternal", flags);
+
+                ModeField = LogEntryType.GetField("mode");
+                MessageField = LogEntryType.GetField("message");
+                FileField = LogEntryType.GetField("file");
+                LineField = LogEntryType.GetField("line");
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[SimpleUnityMCP] LogReader init error: {e.Message}");
+            }
+        }
+
+        public static JObject ReadLogs(JObject parameters)
+        {
+            if (LogEntriesType == null || LogEntryType == null)
+            {
+                return new JObject { ["error"] = "LogEntries reflection not available" };
+            }
+
+            try
+            {
+                // "count" is accepted as an alias for limit.
+                var limit = parameters["limit"]?.Value<int>()
+                    ?? parameters["count"]?.Value<int>()
+                    ?? 50;
+                var offset = parameters["offset"]?.Value<int>() ?? 0;
+                var typeFilter = parameters["type"]?.ToString() ?? "all";
+
+                // Off by default: the entry already names the file and the line, so the trace is
+                // the part worth asking for rather than the part every read has to carry.
+                var withStack = parameters["stackTrace"]?.Value<bool>() ?? false;
+
+                // Checked here rather than in the loop: the loop compares against each name in
+                // turn, so one it does not know narrows nothing and every severity comes back.
+                if (typeFilter != "all" && typeFilter != "error"
+                    && typeFilter != "warning" && typeFilter != "log")
+                {
+                    throw new McpToolException(
+                        "invalid_params",
+                        $"'{typeFilter}' is not a severity. Use all, error, warning or log.");
+                }
+
+                var fieldsParam = parameters["fields"]?.ToString();
+                var fieldsFilter = ListResponseBuilder.ParseFieldsParam(fieldsParam);
+
+                var totalCount = (int)GetCountMethod.Invoke(null, null);
+
+                // Get counts by type
+                var countParams = new object[] { 0, 0, 0 };
+                GetCountsByTypeMethod.Invoke(null, countParams);
+                var errorCount = (int)countParams[0];
+                var warningCount = (int)countParams[1];
+                var logCount = (int)countParams[2];
+
+                StartGettingEntriesMethod.Invoke(null, null);
+                try
+                {
+                    // Collect all matching entries (newest-first) into a flat list first
+                    var allEntries = new List<JObject>();
+
+                    for (var i = totalCount - 1; i >= 0; i--)
+                    {
+                        var entry = Activator.CreateInstance(LogEntryType);
+                        var success = (bool)GetEntryInternalMethod.Invoke(null, new[] { i, entry });
+                        if (!success) continue;
+
+                        var mode = (int)ModeField.GetValue(entry);
+                        var typeChar = GetTypeChar(mode);
+
+                        if (typeFilter != "all")
+                        {
+                            if (typeFilter == "error" && typeChar != "E") continue;
+                            if (typeFilter == "warning" && typeChar != "W") continue;
+                            if (typeFilter == "log" && typeChar != "L") continue;
+                        }
+
+                        var message = (string)MessageField.GetValue(entry) ?? "";
+                        var file = LogNoise.ShortenPath((string)FileField.GetValue(entry) ?? "");
+                        var line = (int)LineField.GetValue(entry);
+
+                        message = withStack
+                            ? LogNoise.TrimStack(message)
+                            : LogNoise.WithoutStack(message);
+
+                        allEntries.Add(new JObject
+                        {
+                            ["t"] = typeChar,
+                            ["m"] = message,
+                            ["f"] = file,
+                            ["l"] = line
+                        });
+                    }
+
+                    var page = ListResponseBuilder.Build(
+                        allEntries,
+                        offset,
+                        limit,
+                        item => item,
+                        fieldsFilter);
+
+                    var result = new JObject
+                    {
+                        ["logs"] = page["items"],
+
+                        // What the request matched, the way every other paged reply counts, and
+                        // beside it what the console holds. One number cannot be both: asking for
+                        // errors in a console of thirteen plain logs answered "total 13" with an
+                        // empty list, which reads as thirteen errors withheld.
+                        // Said rather than left to be noticed: a caller that needs the trace has
+                        // to know it was not sent.
+                        ["stackTrace"] = withStack,
+                        ["total"] = allEntries.Count,
+                        ["inConsole"] = totalCount,
+                        ["errors"] = errorCount,
+                        ["warnings"] = warningCount,
+                        ["truncated"] = page["truncated"],
+                        ["next"] = page["next"]
+                    };
+
+                    var hidden = ConsoleFilterNotice.Hidden(
+                        totalCount, errorCount, warningCount, logCount);
+
+                    if (hidden > 0)
+                    {
+                        result["hiddenByConsoleFilter"] = hidden;
+                        result["note"] = ConsoleFilterNotice.Text(hidden);
+                    }
+
+                    return result;
+                }
+                finally
+                {
+                    EndGettingEntriesMethod.Invoke(null, null);
+                }
+            }
+            catch (McpToolException)
+            {
+                // A refusal is an answer about the request. Folded into the generic failure below
+                // it reads as the console being unreadable, and a caller retries instead of
+                // correcting what it sent.
+                throw;
+            }
+            catch (Exception e)
+            {
+                return new JObject { ["error"] = $"Failed to read logs: {e.Message}" };
+            }
+        }
+
+        // LogEntry.mode flags from the Editor's LogMessageFlags. A Debug.LogError sets
+        // kScriptingError, not kError, and a compiler error sets kScriptCompileError, so testing
+        // bit 0 alone classifies almost everything as a plain log while the count API, which
+        // knows the full set, still reports errors.
+        //
+        // Bit 13 is kStickyLog, not an error bit: it marks an entry the Console keeps when the
+        // user clears it by hand, and Unity's own kErrorLogFlags leaves it out. The compilation
+        // pipeline sets it alongside kScriptingWarning for asmdef and versionDefines problems,
+        // so treating it as an error turned those warnings into errors. Bit 20 exists only in
+        // the managed ConsoleWindow.Mode, not in the native flags these are read from.
+        private const int ErrorFlags =
+            1           // kError
+            | 2         // kAssert
+            | 16        // kFatal
+            | 64        // kAssetImportError
+            | 256       // kScriptingError
+            | 2048      // kScriptCompileError
+            | 131072    // kScriptingException
+            | 2097152;  // kScriptingAssertion
+
+        private const int WarningFlags =
+            128         // kAssetImportWarning
+            | 512       // kScriptingWarning
+            | 4096;     // kScriptCompileWarning
+
+        internal static string GetTypeChar(int mode)
+        {
+            if ((mode & ErrorFlags) != 0) return "E";
+            if ((mode & WarningFlags) != 0) return "W";
+            return "L";
+        }
+    }
+}
