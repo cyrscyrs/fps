@@ -34,6 +34,9 @@ public class Zombie : MonoBehaviour
     // 血量组件：僵尸预制体上挂着 Health，子弹打中时扣的就是它
     private Health health;
 
+    // 叫声组件（可选）：挂了 ZombieAudio 才会播 idle / battle / dying 音效
+    private ZombieAudio zombieAudio;
+
     [Header("玩家")]
     [SerializeField] private Transform player;              // 留空则在开始游戏时自动按 Tag 查找
     [SerializeField] private string playerTag = "Player";
@@ -167,6 +170,7 @@ public class Zombie : MonoBehaviour
         }
 
         health = GetComponent<Health>();
+        zombieAudio = GetComponent<ZombieAudio>();   // 状态机初始化前先拿到，第一声 Idle 叫声才不会漏
         if (health != null) health.Died += Die;   // 血量归零 -> 进入死亡状态
 
         anim.applyRootMotion = false;   // 位移交给脚本控制，否则根运动会把僵尸自己带跑
@@ -443,6 +447,12 @@ public class Zombie : MonoBehaviour
     public void LogState(string stateName)
     {
         if (logStateChanges) Debug.Log($"[Zombie] {name} -> {stateName}", this);
+    }
+
+    /// <summary>切换状态时通知叫声组件：Idle 放 idle 叫声、追人放 battle 叫声、死亡放 dying 叫声。</summary>
+    public void NotifyStateEntered(ZombieState state)
+    {
+        if (zombieAudio != null) zombieAudio.OnStateEntered(state);
     }
 
     private Transform FindPlayer()

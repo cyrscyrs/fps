@@ -25,6 +25,12 @@ public class Health : MonoBehaviour, IDamageable
     /// <summary>生命值降到 0 时触发一次。</summary>
     public event Action Died;
 
+    /// <summary>
+    /// 生命值只要发生变化就会触发：受伤、回血、读档设值、重生回满都算。
+    /// UI（血条）订阅这个就能一直显示对的血量，不会出现「数值改了但界面还停在旧值」。
+    /// </summary>
+    public event Action Changed;
+
     public float MaxHealth => maxHealth;
     public float CurrentHealth { get; private set; }
 
@@ -49,6 +55,7 @@ public class Health : MonoBehaviour, IDamageable
             Debug.Log($"[Health] {name} 受到 {damage:0.#} 点伤害，剩余 {CurrentHealth:0.#}/{maxHealth:0.#}", this);
 
         Damaged?.Invoke(damage, attacker);
+        Changed?.Invoke();
 
         if (IsDead) Die();
     }
@@ -59,12 +66,21 @@ public class Health : MonoBehaviour, IDamageable
         if (IsDead || amount <= 0f) return;
 
         CurrentHealth = Mathf.Min(maxHealth, CurrentHealth + amount);
+        Changed?.Invoke();
     }
 
     /// <summary>回满血（重生用）。注意：这个方法不会重新触发死亡/复活事件。</summary>
     public void ResetHealth()
     {
         CurrentHealth = maxHealth;
+        Changed?.Invoke();   // 重生回满血，血条也要跟着刷新
+    }
+
+    /// <summary>直接把血量设成某个值（读档用）。不会触发受击/死亡事件，值会被限制在 0~最大血量。</summary>
+    public void SetHealth(float value)
+    {
+        CurrentHealth = Mathf.Clamp(value, 0f, maxHealth);
+        Changed?.Invoke();   // 读档设值也要通知 UI，否则血条会停在旧数字上
     }
 
     /// <summary>改最大血量。refill 为 true 时顺手回满，常用于初始化不同血量的敌人。</summary>
@@ -72,11 +88,13 @@ public class Health : MonoBehaviour, IDamageable
     {
         maxHealth = Mathf.Max(1f, value);
         CurrentHealth = refill ? maxHealth : Mathf.Min(CurrentHealth, maxHealth);
+        Changed?.Invoke();
     }
 
     private void Die()
     {
         CurrentHealth = 0f;
+        Changed?.Invoke();
 
         if (logDamage) Debug.Log($"[Health] {name} 死亡", this);
 

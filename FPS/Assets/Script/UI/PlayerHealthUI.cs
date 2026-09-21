@@ -32,7 +32,7 @@ public class PlayerHealthUI : MonoBehaviour
         if (target == null) target = FindPlayerHealth();
         if (target != null)
         {
-            target.Damaged += OnDamaged;
+            target.Changed += OnHealthChanged;   // 血量任何变化都刷新（受伤 / 读档 / 重生回满）
             target.Died += OnDied;
         }
 
@@ -43,12 +43,12 @@ public class PlayerHealthUI : MonoBehaviour
     {
         if (target != null)
         {
-            target.Damaged -= OnDamaged;
+            target.Changed -= OnHealthChanged;
             target.Died -= OnDied;
         }
     }
 
-    private void OnDamaged(float damage, GameObject attacker)
+    private void OnHealthChanged()
     {
         Refresh();
     }

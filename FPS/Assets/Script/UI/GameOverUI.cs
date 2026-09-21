@@ -25,6 +25,9 @@ public class GameOverUI : MonoBehaviour
 
     private bool isShown;
 
+    /// <summary>失败画面是不是正显示着（暂停界面靠它判断该不该响应 ESC）。</summary>
+    public bool IsShown => isShown;
+
     private void Awake()
     {
         UIFonts.Apply(gameObject);

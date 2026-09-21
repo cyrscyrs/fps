@@ -35,6 +35,7 @@ public class ZombieState
         triggerCalled = false;
 
         zombie.LogState(GetType().Name);
+        zombie.NotifyStateEntered(this);   // 通知叫声组件：Idle / 追人 / 死亡 各放各的音效
     }
 
     public virtual void Update()

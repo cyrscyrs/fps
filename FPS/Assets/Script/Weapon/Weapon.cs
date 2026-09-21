@@ -15,6 +15,7 @@ public class Weapon : MonoBehaviour
     private float timer = 0;
     private PlayerControll pc;
     private RecoliControl rc;
+    private WeaponAudio weaponAudio;   // 开火音效（玩家预制体上挂了 WeaponAudio 才会响）
 
     private ObjectPool<GameObject> bulletPool;
     private ObjectPool<GameObject> firePool;
@@ -51,6 +52,7 @@ public class Weapon : MonoBehaviour
     {
         pc = GetComponent<PlayerControll>();
         rc = GetComponent<RecoliControl>();
+        weaponAudio = GetComponent<WeaponAudio>();
     }
 
     // Update is called once per frame
@@ -65,11 +67,19 @@ public class Weapon : MonoBehaviour
         if(Input.GetMouseButton(0) && timer >= bulletInterval && !pc.isFast)
         {
             timer = 0;
-            SpawnBullet();
-            SpawnFire();
-            rc.Fire();
-            //Instantiate(bulletPre, firePoint.transform.position, firePoint.transform.rotation);
+            FireOnce();
         }
+    }
+
+    /// <summary>开一枪：生成子弹 + 枪口火焰 + 后坐力 + 开火音效。（按住左键时 Update 按 bulletInterval 调这里）</summary>
+    public void FireOnce()
+    {
+        SpawnBullet();
+        SpawnFire();
+        rc.Fire();
+
+        // 每开一枪放一声 single-gun-shot-sound
+        if (weaponAudio != null) weaponAudio.PlayShot();
     }
 
     GameObject createBullet()

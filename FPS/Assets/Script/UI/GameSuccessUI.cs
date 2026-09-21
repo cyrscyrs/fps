@@ -28,6 +28,9 @@ public class GameSuccessUI : MonoBehaviour
 
     private bool isShown;
 
+    /// <summary>成功画面是不是正显示着（暂停界面靠它判断该不该响应 ESC）。</summary>
+    public bool IsShown => isShown;
+
     /// <summary>下一关在 Build Settings 里的下标；没有下一关就是 -1。</summary>
     public int NextLevelIndex { get; private set; } = -1;
 

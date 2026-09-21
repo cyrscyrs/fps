@@ -17027,10 +17027,6 @@ PrefabInstance:
     serializedVersion: 3
     m_TransformParent: {fileID: 0}
     m_Modifications:
-    - target: {fileID: 867532253970185494, guid: 198add40dacf2c14f8682d7ecb9f7072, type: 3}
-      propertyPath: target
-      value: 
-      objectReference: {fileID: 0}
     - target: {fileID: 6274620122522835751, guid: 198add40dacf2c14f8682d7ecb9f7072, type: 3}
       propertyPath: m_Name
       value: HUDCanvas
@@ -17114,10 +17110,6 @@ PrefabInstance:
     - target: {fileID: 7935750060396846065, guid: 198add40dacf2c14f8682d7ecb9f7072, type: 3}
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
-      objectReference: {fileID: 0}
-    - target: {fileID: 8334382294750476910, guid: 198add40dacf2c14f8682d7ecb9f7072, type: 3}
-      propertyPath: playerHealth
-      value: 
       objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
